@@ -1,55 +1,84 @@
 import chainlit as cl
 import asyncio
+import os
+import google.generativeai as genai
 from crewai.flow import Flow, start
 from shopping_flow.crews.shopping_crew.shopping_crew import ShoppingCrew
+
+# Load the API key from an environment variable
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise ValueError("API key not found. Please set the GEMINI_API_KEY environment variable.")
+
+# Initialize Gemini model
+genai.configure(api_key=api_key)
+model = genai.GenerativeModel("gemini-1.5-flash")  # Correct model usage
+
+# Model settings
+settings = {
+    "temperature": 0.7,
+    "max_output_tokens": 500,
+    "top_p": 1,
+}
 
 class ShoppingFlow(Flow):
     @start()
     def find_best_products(self, product_prompt):
-        # This is a synchronous method
-        result = ShoppingCrew().crew().kickoff(inputs={"product": product_prompt})
-        return result
+        """Calls CrewAI to find the best product recommendations."""
+        return ShoppingCrew().crew().kickoff(inputs={"product": product_prompt})
 
 @cl.on_chat_start
-async def on_chat_start():
-    cl.user_session.set("flow", ShoppingFlow())
+def start_chat():
+    """Initialize session with conversation history."""
+    cl.user_session.set(
+        "message_history",
+        [{"role": "system", "content": "You are a helpful assistant."}],
+    )
+    cl.user_session.set("flow", ShoppingFlow())  # Store the shopping flow instance
+
 
 @cl.on_message
-async def on_message(message: cl.Message):
+async def main(message: cl.Message):
+    """Handles incoming messages and generates responses."""
+    message_history = cl.user_session.get("message_history")
     flow = cl.user_session.get("flow")
-    
-    # Show thinking indicator while processing
-    with cl.Step(name="Finding Best Products") as step:
-        step.input = message.content
-        
-        # Create a temporary thinking message
-        thinking_msg = cl.Message(content="Processing your request...")
-        await thinking_msg.send()
-        
-        # Run the synchronous CrewAI operation in a separate thread to not block the async event loop
-        # This is a common pattern for running sync code in async contexts
-        result = await asyncio.to_thread(flow.find_best_products, message.content)
-        
-        # Update the step with the result
-        step.output = result
-        
-        # Remove the thinking message
-        await thinking_msg.update()
-        await thinking_msg.remove()
-    
-    # Send final result to user
-    await cl.Message(content=result).send()
+
+    # Save user message to history
+    message_history.append({"role": "user", "content": message.content})
+
+    # Show processing indicator
+    thinking_msg = cl.Message(content="Processing your request...")
+    await thinking_msg.send()
+
+    # Step 1: Try CrewAI for product recommendations
+    crew_output = await asyncio.to_thread(flow.find_best_products, message.content)
+
+    # Step 2: If CrewAI output is valid, use it; otherwise, use Gemini
+    if crew_output:
+        response_text = getattr(crew_output, "text", str(crew_output))  # Extract text safely
+    else:
+        gemini_response = await asyncio.to_thread(model.generate_content, message_history, **settings)
+        response_text = gemini_response.text.strip()
+
+    # Ensure Markdown formatting
+    formatted_result = response_text.replace("\\n", "\n")
+
+    # Save response to conversation history
+    message_history.append({"role": "assistant", "content": formatted_result})
+
+    # Remove processing message and send final response
+    await thinking_msg.remove()
+    await cl.Message(content=formatted_result).send()
+
 
 def plot():
-    poem_flow = ShoppingFlow()
-    poem_flow.plot()
+    """Visualize the CrewAI workflow."""
+    ShoppingFlow().plot()
 
-# The following is only used when running the script directly
-# Chainlit will use its own entry point
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "plot":
         plot()
     else:
-        # This won't be used when running with chainlit
         print("To use the UI, run with: chainlit run main.py")
